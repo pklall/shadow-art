@@ -5,10 +5,15 @@ import PIL.ImageOps
 from solid import *
 from solid.utils import *
 import os
+import subprocess
+from subprocess import call
 
 class scad_import( openscad_object):
     def __init__(self, f):
         openscad_object.__init__(self, 'import', {"file":f})
+"""
+exec(new_openscad_class_str("offset", ["delta"], ["join_type", "miter_limit"]))
+"""
 
 def genGlobalIndex():
     genGlobalIndex.counter += 1
@@ -112,9 +117,7 @@ def imgToPolyhedron(img, channel = 3):
     # FIXME 10 is completely arbitrary
     return polyhedron(points, triangles, 10)
 
-def imgToPoly(img, channel = 3, invert = False):
-    if invert:
-        img = PIL.ImageOps.invert(img)
+def imgToPoly(img, channel = 3):
     heightmapFilename = "./results/heightmap_" + str(genGlobalIndex()) + ".dat"
     hfile = open(heightmapFilename, "w")
     size = img.size
@@ -128,29 +131,110 @@ def imgToPoly(img, channel = 3, invert = False):
             hfile.write(str(z) + " ")
         hfile.write("\n")
     hfile.close()
-    return surface(file=os.path.abspath(heightmapFilename), center=True, convexity=10)
+    maxS = max(size[0], size[1])
+    return scale([maxS, maxS, 1])(
+            surface(file=os.path.abspath(heightmapFilename), center=True, convexity=10)
+            )
+
+def erodeImage(img, itercount = 2):
+    eimg = img.copy()
+    size = img.size
+    for i in range(itercount):
+        tmp = img
+        img = eimg
+        eimg = tmp
+        for y in range(0, size[1]):
+            for x in range(0, size[0]):
+                mval = img.getpixel((x, y))
+                if x > 0:
+                    mval = min(mval, img.getpixel((x - 1, y)))
+                else:
+                    mval = 0
+                if x < size[0] - 1:
+                    mval = min(mval, img.getpixel((x + 1, y)))
+                else:
+                    mval = 0
+                if y > 0:
+                    mval = min(mval, img.getpixel((x, y - 1)))
+                else:
+                    mval = 0
+                if y < size[1] - 1:
+                    mval = min(mval, img.getpixel((x, y + 1)))
+                else:
+                    mval = 0
+                eimg.putpixel((x, y), mval)
+    return eimg
 
 def polyToOutline(poly):
     return projection(cut=True)(down(128)(poly))
 
+def shadowVolumeFromOutlines(outlines):
+    extruded = [linear_extrude(height=10000, center=True, convexity=3)(o) for o in outlines]
 
-if __name__=="__main__":
-    # images = ["./input/u.png", "./input/v.png", "./input/a.png"]
-    images = ["./input/cat.png", "./input/dog.png"]
-    invert = True
-
-    images = [Image.open(fname) for fname in images]
-
-    [img.thumbnail((32, 32), Image.ANTIALIAS) for img in images]
-
-    ps = [imgToPoly(img, 0, invert) for img in images]
-
-    outlines = [polyToOutline(p) for p in ps]
-
-    extruded = [linear_extrude(height=9999, center=True, convexity=3)(o) for o in outlines]
-
-    extruded[0] = rotate([0, 90, 0])(extruded[0])
+    extruded[0] = rotate([-90, 0, 0])(extruded[0])
 
     shadowVolume = intersection()([extruded[0], extruded[1]])
 
-    scad_render_to_file(shadowVolume, "results/out.scad")
+    return shadowVolume
+
+def outlinesFromShadowVolume(s):
+    return [projection(cut=False)(rotate([90, 0, 0])(s)), projection(cut=False)(s)]
+
+def shadowVolumeFromImages(images, size = 32, invert = False, erode = False):
+    images = [PIL.ImageOps.grayscale(img) for img in images]
+    if invert:
+        images = [PIL.ImageOps.invert(img) for img in images]
+
+    if erode:
+        images = [erodeImage(i, 5) for i in images]
+
+    images = [img.resize((size, size), Image.ANTIALIAS) for img in images]
+
+    ps = [imgToPoly(img, 0) for img in images]
+
+    outlines = [polyToOutline(p) for p in ps]
+
+    shadowVolume = shadowVolumeFromOutlines(outlines)
+    
+    return shadowVolume
+
+def generateSTLFiles(imageFiles):
+    # images = ["./input/u.png", "./input/v.png", "./input/a.png"]
+    images = imageFiles
+    images = [Image.open(fname) for fname in images]
+    invert = True
+
+    size = 32
+
+    shadowVolume = shadowVolumeFromImages(images, size, invert, erode = False)
+    scad_render_to_file(shadowVolume, "results/shadow.scad")
+
+    eShadowVolume = shadowVolumeFromImages(images, size, invert, erode = True)
+    scad_render_to_file(eShadowVolume, "results/eshadow.scad")
+
+    # Invoke OpenSCAD to convert both of the above to STL
+    p1 = subprocess.Popen(["./extern/openscad-2014.03/bin/openscad",
+        "-o",
+        "results/shadow.stl",
+        "./results/shadow.scad"])
+
+    p2 = subprocess.Popen(["./extern/openscad-2014.03/bin/openscad",
+        "-o",
+        "results/eshadow.stl",
+        "./results/eshadow.scad"])
+
+    print("Running OpenSCAD to generate initial STL models...")
+    p1.wait()
+    p2.wait()
+    print("Done")
+
+if __name__=="__main__":
+    # generateSTLFiles(["./input/cat.png", "./input/dog.png"])
+
+    s = scad_import(os.path.abspath("./results/shadow.stl"))
+    es = scad_import(os.path.abspath("./results/eshadow.stl"))
+    sOut = outlinesFromShadowVolume(s)
+    esOut = outlinesFromShadowVolume(es)
+    scad_render_to_file(linear_extrude(height=1, center=True, convexity=3)(sOut[0]), "./results/test.scad")
+    # scad_render_to_file(difference()(s, es), "./results/test.scad")
+
